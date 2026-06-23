@@ -77,7 +77,7 @@ Successful response:
 PDFs are saved to the `output/` directory in this repo (mounted into the container). The filename pattern is:
 
 ```
-output/Sridhar_Resume_{Company}_{Role}.pdf
+output/Name_Resume_{Company}_{Role}.pdf
 ```
 
 ---
