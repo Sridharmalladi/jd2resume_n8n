@@ -8,61 +8,31 @@
         "responseMode": "responseNode",
         "options": {}
       },
-      "id": "webhook-trigger",
+      "id": "node-webhook",
       "name": "Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 1,
-      "position": [240, 300]
+      "position": [200, 400]
     },
     {
       "parameters": {
-        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst jd = body.jd;\n\nif (!jd || typeof jd !== 'string' || jd.trim().length === 0) {\n  throw new Error('Missing or empty jd field in request body');\n}\n\n// reset retry counter on each fresh request\n$workflow.staticData.retryCount = 0;\n$workflow.staticData.pageRetryCount = 0;\n\nreturn [{ json: { jd: jd.trim() } }];"
+        "jsCode": "const fs = require('fs');\nconst body = $input.first().json.body || $input.first().json;\nconst jd = body.jd;\n\nif (!jd || typeof jd !== 'string' || jd.trim().length === 0) {\n  throw new Error('Missing or empty jd field in request body');\n}\n\n$workflow.staticData.retryCount = 0;\n$workflow.staticData.pageRetryCount = 0;\n$workflow.staticData.retryReason = null;\n\nconst resume = JSON.parse(fs.readFileSync('/app/data/master_resume.json', 'utf-8'));\nconst extractPrompt = fs.readFileSync('/app/prompts/extract_metadata.md', 'utf-8');\nconst tailorPrompt = fs.readFileSync('/app/prompts/tailor_system.md', 'utf-8');\nconst htmlTemplate = fs.readFileSync('/app/templates/resume.html', 'utf-8');\n\nreturn [{ json: { jd: jd.trim(), resume, extractPrompt, tailorPrompt, htmlTemplate } }];"
       },
-      "id": "validate-input",
-      "name": "Validate Input",
+      "id": "node-load",
+      "name": "Load and Validate",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [460, 300]
+      "position": [420, 400]
     },
     {
       "parameters": {
-        "filePath": "/data/master_resume.json"
+        "jsCode": "const { jd, resume, extractPrompt, tailorPrompt, htmlTemplate } = $input.first().json;\n\nconst requestBody = JSON.stringify({\n  model: 'claude-sonnet-4-6',\n  max_tokens: 300,\n  system: extractPrompt,\n  messages: [{ role: 'user', content: jd }]\n});\n\nreturn [{ json: { requestBody, jd, resume, tailorPrompt, htmlTemplate } }];"
       },
-      "id": "read-master-resume",
-      "name": "Read Master Resume",
-      "type": "n8n-nodes-base.readBinaryFile",
-      "typeVersion": 1,
-      "position": [680, 300]
-    },
-    {
-      "parameters": {
-        "jsCode": "const binaryData = $input.first().binary.data;\nconst jsonStr = Buffer.from(binaryData.data, 'base64').toString('utf-8');\nconst resume = JSON.parse(jsonStr);\nconst jd = $('Validate Input').first().json.jd;\nreturn [{ json: { resume, jd } }];"
-      },
-      "id": "parse-resume",
-      "name": "Parse Resume JSON",
+      "id": "node-build-extract",
+      "name": "Build Extract Request",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [900, 300]
-    },
-    {
-      "parameters": {
-        "filePath": "/data/prompts/extract_metadata.md"
-      },
-      "id": "read-extract-prompt",
-      "name": "Read Extract Prompt",
-      "type": "n8n-nodes-base.readBinaryFile",
-      "typeVersion": 1,
-      "position": [1120, 300]
-    },
-    {
-      "parameters": {
-        "jsCode": "const binaryData = $input.first().binary.data;\nconst prompt = Buffer.from(binaryData.data, 'base64').toString('utf-8');\nconst jd = $('Parse Resume JSON').first().json.jd;\nreturn [{ json: { extractPrompt: prompt, jd } }];"
-      },
-      "id": "prep-extract-call",
-      "name": "Prep Extract Call",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [1340, 300]
+      "position": [640, 400]
     },
     {
       "parameters": {
@@ -77,51 +47,26 @@
           ]
         },
         "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            {
-              "name": "=",
-              "value": "={{ JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 256, system: $json.extractPrompt, messages: [{ role: 'user', content: $json.jd }] }) }}"
-            }
-          ]
-        },
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.requestBody }}",
         "options": {}
       },
-      "id": "anthropic-extract",
+      "id": "node-anthropic-extract",
       "name": "Anthropic: Extract Metadata",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1560, 300]
+      "position": [860, 400]
     },
     {
       "parameters": {
-        "jsCode": "const resp = $input.first().json;\nconst text = resp.content[0].text.trim();\nlet meta;\ntry {\n  const match = text.match(/\\{[\\s\\S]*\\}/);\n  meta = JSON.parse(match ? match[0] : text);\n} catch(e) {\n  throw new Error('Metadata extraction returned invalid JSON: ' + text);\n}\nconst resume = $('Parse Resume JSON').first().json.resume;\nconst jd = $('Parse Resume JSON').first().json.jd;\nreturn [{ json: { meta, resume, jd } }];"
+        "jsCode": "const resp = $input.first().json;\nconst text = resp.content[0].text.trim();\n\nlet meta;\ntry {\n  const match = text.match(/\\{[\\s\\S]*\\}/);\n  meta = JSON.parse(match ? match[0] : text);\n} catch (e) {\n  throw new Error('Metadata extraction returned invalid JSON: ' + text.substring(0, 200));\n}\n\nconst base = $('Build Extract Request').first().json;\nconst retryReason = $workflow.staticData.retryReason || null;\n\nlet userMsg = `MASTER RESUME:\\n${JSON.stringify(base.resume, null, 2)}\\n\\nJOB DESCRIPTION:\\n${base.jd}`;\nif (retryReason) {\n  userMsg += `\\n\\nREVISION REQUIRED: ${retryReason}`;\n}\n\nconst requestBody = JSON.stringify({\n  model: 'claude-sonnet-4-6',\n  max_tokens: 4096,\n  system: base.tailorPrompt,\n  messages: [{ role: 'user', content: userMsg }]\n});\n\nreturn [{ json: { requestBody, meta, jd: base.jd, resume: base.resume, tailorPrompt: base.tailorPrompt, htmlTemplate: base.htmlTemplate } }];"
       },
-      "id": "parse-metadata",
+      "id": "node-parse-meta",
       "name": "Parse Metadata",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1780, 300]
-    },
-    {
-      "parameters": {
-        "filePath": "/data/prompts/tailor_system.md"
-      },
-      "id": "read-tailor-prompt",
-      "name": "Read Tailor Prompt",
-      "type": "n8n-nodes-base.readBinaryFile",
-      "typeVersion": 1,
-      "position": [2000, 300]
-    },
-    {
-      "parameters": {
-        "jsCode": "const binaryData = $input.first().binary.data;\nconst systemPrompt = Buffer.from(binaryData.data, 'base64').toString('utf-8');\nconst { meta, resume, jd } = $('Parse Metadata').first().json;\nconst retryReason = $workflow.staticData.retryReason || null;\n\nlet userMsg = `MASTER RESUME:\\n${JSON.stringify(resume, null, 2)}\\n\\nJOB DESCRIPTION:\\n${jd}`;\nif (retryReason) {\n  userMsg += `\\n\\nREVISION REQUIRED: ${retryReason}`;\n}\n\nreturn [{ json: { systemPrompt, userMsg, meta, resume, jd } }];"
-      },
-      "id": "prep-tailor-call",
-      "name": "Prep Tailor Call",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [2220, 300]
+      "position": [1080, 400]
     },
     {
       "parameters": {
@@ -136,97 +81,78 @@
           ]
         },
         "sendBody": true,
-        "bodyParameters": {
-          "parameters": [
-            {
-              "name": "=",
-              "value": "={{ JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, system: $json.systemPrompt, messages: [{ role: 'user', content: $json.userMsg }] }) }}"
-            }
-          ]
-        },
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.requestBody }}",
         "options": {}
       },
-      "id": "anthropic-tailor",
+      "id": "node-anthropic-tailor",
       "name": "Anthropic: Tailor Resume",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2440, 300]
+      "position": [1300, 400]
     },
     {
       "parameters": {
-        "jsCode": "const resp = $input.first().json;\nconst text = resp.content[0].text.trim();\n\nlet tailored;\ntry {\n  const match = text.match(/\\{[\\s\\S]*\\}/);\n  tailored = JSON.parse(match ? match[0] : text);\n} catch(e) {\n  throw new Error('Tailoring returned invalid JSON: ' + text.substring(0, 200));\n}\n\nconst SUMMARY_LIMIT = 280;\nconst BULLET_CEIL = 220;\nconst BULLET_FLOOR = 150;\nconst PROJECT_DESC_LIMIT = 180;\n\nconst errors = [];\n\nif (!tailored.summary || tailored.summary.length > SUMMARY_LIMIT) {\n  errors.push(`Summary exceeds ${SUMMARY_LIMIT} chars (got ${tailored.summary?.length})`);\n}\n\nif (!Array.isArray(tailored.tech_stack) || tailored.tech_stack.length < 8 || tailored.tech_stack.length > 12) {\n  errors.push(`tech_stack must have 8-12 items (got ${tailored.tech_stack?.length})`);\n}\n\nfor (const job of (tailored.experience || [])) {\n  for (const bullet of (job.bullets || [])) {\n    if (bullet.length > BULLET_CEIL) {\n      errors.push(`Bullet exceeds ${BULLET_CEIL} chars in ${job.company}: \"${bullet.substring(0, 60)}...\"`);\n    } else if (bullet.length < BULLET_FLOOR) {\n      errors.push(`Bullet under ${BULLET_FLOOR} chars in ${job.company}: \"${bullet.substring(0, 60)}...\"`);\n    }\n  }\n}\n\nfor (const proj of (tailored.projects || [])) {\n  if (proj.description && proj.description.length > PROJECT_DESC_LIMIT) {\n    errors.push(`Project \"${proj.name}\" description exceeds ${PROJECT_DESC_LIMIT} chars`);\n  }\n}\n\nif (tailored.projects && tailored.projects.length > 2) {\n  tailored.projects = tailored.projects.slice(0, 2);\n}\n\nconst retryCount = $workflow.staticData.retryCount || 0;\nconst needsRetry = errors.length > 0;\n\nif (needsRetry) {\n  $workflow.staticData.retryReason = `Previous response exceeded length limits. Issues: ${errors.join('; ')}. Compress while preserving all hard numbers and tools. Stay within the bullet formula (150-220 chars).`;\n}\n\nreturn [{ json: { tailored, needsRetry, retryCount, errors } }];"
+        "jsCode": "const resp = $input.first().json;\nconst text = resp.content[0].text.trim();\n\nlet tailored;\ntry {\n  const match = text.match(/\\{[\\s\\S]*\\}/);\n  tailored = JSON.parse(match ? match[0] : text);\n} catch (e) {\n  throw new Error('Tailoring returned invalid JSON: ' + text.substring(0, 200));\n}\n\nconst SUMMARY_LIMIT = 280;\nconst BULLET_CEIL = 220;\nconst BULLET_FLOOR = 150;\nconst PROJECT_LIMIT = 180;\n\nconst errors = [];\n\nif (!tailored.summary || tailored.summary.length > SUMMARY_LIMIT) {\n  errors.push(`Summary too long (${tailored.summary?.length ?? 0} chars, limit ${SUMMARY_LIMIT})`);\n}\nif (!Array.isArray(tailored.tech_stack) || tailored.tech_stack.length < 8 || tailored.tech_stack.length > 12) {\n  errors.push(`tech_stack must have 8-12 items (got ${tailored.tech_stack?.length ?? 0})`);\n}\nfor (const job of (tailored.experience || [])) {\n  for (const bullet of (job.bullets || [])) {\n    if (bullet.length > BULLET_CEIL) {\n      errors.push(`Bullet too long in ${job.company} (${bullet.length} chars, ceiling ${BULLET_CEIL})`);\n    } else if (bullet.length < BULLET_FLOOR) {\n      errors.push(`Bullet too short in ${job.company} (${bullet.length} chars, floor ${BULLET_FLOOR})`);\n    }\n  }\n}\nfor (const proj of (tailored.projects || [])) {\n  if (proj.description && proj.description.length > PROJECT_LIMIT) {\n    errors.push(`Project \"${proj.name}\" description too long (${proj.description.length} chars)`);\n  }\n}\nif (tailored.projects && tailored.projects.length > 2) {\n  tailored.projects = tailored.projects.slice(0, 2);\n}\n\nconst needsRetry = errors.length > 0;\nconst retryCount = $workflow.staticData.retryCount || 0;\n\nif (needsRetry) {\n  $workflow.staticData.retryReason = `Previous response exceeded limits: ${errors.join('; ')}. Compress while preserving all hard numbers and tools. Bullets must be ${BULLET_FLOOR}-${BULLET_CEIL} chars each.`;\n}\n\nconst base = $('Parse Metadata').first().json;\n\nreturn [{ json: {\n  tailored, needsRetry, retryCount, errors,\n  jd: base.jd,\n  resume: base.resume,\n  tailorPrompt: base.tailorPrompt,\n  htmlTemplate: base.htmlTemplate,\n  meta: base.meta\n} }];"
       },
-      "id": "validate-lengths",
+      "id": "node-validate",
       "name": "Validate Lengths",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2660, 300]
+      "position": [1520, 400]
     },
     {
       "parameters": {
         "conditions": {
           "boolean": [
             {
-              "value1": "={{ $json.needsRetry && $json.retryCount < 2 }}",
+              "value1": "={{ $json.needsRetry === true && $json.retryCount < 2 }}",
               "value2": true
             }
           ]
         }
       },
-      "id": "retry-check",
+      "id": "node-needs-retry",
       "name": "Needs Retry?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 1,
-      "position": [2880, 300]
+      "position": [1740, 400]
     },
     {
       "parameters": {
-        "jsCode": "// increment retry counter and loop back\n$workflow.staticData.retryCount = ($workflow.staticData.retryCount || 0) + 1;\nconst { tailored, errors } = $input.first().json;\nreturn [{ json: { tailored, errors, retryCount: $workflow.staticData.retryCount } }];"
+        "jsCode": "$workflow.staticData.retryCount = ($workflow.staticData.retryCount || 0) + 1;\nconst retryReason = $workflow.staticData.retryReason;\nconst base = $('Parse Metadata').first().json;\n\nconst userMsg = `MASTER RESUME:\\n${JSON.stringify(base.resume, null, 2)}\\n\\nJOB DESCRIPTION:\\n${base.jd}\\n\\nREVISION REQUIRED: ${retryReason}`;\n\nconst requestBody = JSON.stringify({\n  model: 'claude-sonnet-4-6',\n  max_tokens: 4096,\n  system: base.tailorPrompt,\n  messages: [{ role: 'user', content: userMsg }]\n});\n\nreturn [{ json: { requestBody } }];"
       },
-      "id": "increment-retry",
-      "name": "Increment Retry",
+      "id": "node-inc-retry",
+      "name": "Increment Length Retry",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3100, 200]
+      "position": [1960, 280]
     },
     {
       "parameters": {
-        "jsCode": "const { tailored } = $input.first().json;\n\nconst resume = $('Parse Resume JSON').first().json.resume;\n\n// Build experience HTML\nlet expHtml = '';\nfor (const job of tailored.experience) {\n  const bullets = (job.bullets || []).map(b => `<li>${b}</li>`).join('\\n        ');\n  expHtml += `\n  <div class=\"job\">\n    <div class=\"job-header\">\n      <div>\n        <span class=\"job-title\">${job.title}</span> &mdash;\n        <span class=\"job-company\">${job.company}</span>\n        <span class=\"job-location\">&nbsp;·&nbsp;${job.location}</span>\n      </div>\n      <div class=\"job-dates\">${job.start} – ${job.end}</div>\n    </div>\n    <ul class=\"bullets\">\n        ${bullets}\n    </ul>\n  </div>`;\n}\n\n// Build projects HTML\nlet projHtml = '';\nfor (const proj of (tailored.projects || []).slice(0, 2)) {\n  projHtml += `\n  <div class=\"project\">\n    <span class=\"project-name\">${proj.name}</span>\n    <span class=\"project-desc\"> — ${proj.description}</span>\n  </div>`;\n}\n\n// Education (static from master)\nlet eduHtml = '';\nfor (const edu of resume.education) {\n  eduHtml += `\n  <div class=\"edu-row\">\n    <div>\n      <div class=\"edu-school\">${edu.school}</div>\n      <div class=\"edu-degree\">${edu.degree}</div>\n    </div>\n    <div class=\"edu-meta\">${edu.date}<br>GPA: ${edu.gpa}</div>\n  </div>`;\n}\n\nreturn [{ json: { tailored, expHtml, projHtml, eduHtml } }];"
+        "jsCode": "const { tailored, htmlTemplate } = $input.first().json;\nconst resume = $('Load and Validate').first().json.resume;\n\nlet expHtml = '';\nfor (const job of tailored.experience) {\n  const bullets = (job.bullets || []).map(b => `<li>${b}</li>`).join('\\n        ');\n  expHtml += `\\n  <div class=\"job\">\\n    <div class=\"job-header\">\\n      <div>\\n        <span class=\"job-title\">${job.title}</span> &mdash;\\n        <span class=\"job-company\">${job.company}</span>\\n        <span class=\"job-location\">&nbsp;&middot;&nbsp;${job.location}</span>\\n      </div>\\n      <div class=\"job-dates\">${job.start} &ndash; ${job.end}</div>\\n    </div>\\n    <ul class=\"bullets\">\\n        ${bullets}\\n    </ul>\\n  </div>`;\n}\n\nlet projHtml = '';\nfor (const proj of (tailored.projects || []).slice(0, 2)) {\n  projHtml += `\\n  <div class=\"project\">\\n    <span class=\"project-name\">${proj.name}</span>\\n    <span class=\"project-desc\"> &mdash; ${proj.description}</span>\\n  </div>`;\n}\n\nlet eduHtml = '';\nfor (const edu of resume.education) {\n  eduHtml += `\\n  <div class=\"edu-row\">\\n    <div>\\n      <div class=\"edu-school\">${edu.school}</div>\\n      <div class=\"edu-degree\">${edu.degree}</div>\\n    </div>\\n    <div class=\"edu-meta\">${edu.date}<br>GPA: ${edu.gpa}</div>\\n  </div>`;\n}\n\nlet html = htmlTemplate;\nhtml = html.replace('{{name}}', resume.name);\nhtml = html.replace('{{email}}', resume.contact.email);\nhtml = html.replace('{{phone}}', resume.contact.phone);\nhtml = html.replace('{{location}}', resume.contact.location);\nhtml = html.replace('{{linkedin}}', resume.contact.linkedin);\nhtml = html.replace('{{github}}', resume.contact.github);\nhtml = html.replace('{{summary}}', tailored.summary);\nhtml = html.replace('{{tech_stack}}', tailored.tech_stack.join(' &middot; '));\nhtml = html.replace('{{experience}}', expHtml);\nhtml = html.replace('{{projects}}', projHtml);\nhtml = html.replace('{{education}}', eduHtml);\n\nreturn [{ json: { tailored, renderedHtml: html } }];"
       },
-      "id": "build-html-parts",
-      "name": "Build HTML Parts",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [3100, 400]
-    },
-    {
-      "parameters": {
-        "filePath": "/data/templates/resume.html"
-      },
-      "id": "read-template",
-      "name": "Read Template",
-      "type": "n8n-nodes-base.readBinaryFile",
-      "typeVersion": 1,
-      "position": [3320, 400]
-    },
-    {
-      "parameters": {
-        "jsCode": "const binaryData = $input.first().binary.data;\nlet html = Buffer.from(binaryData.data, 'base64').toString('utf-8');\n\nconst resume = $('Parse Resume JSON').first().json.resume;\nconst { tailored, expHtml, projHtml, eduHtml } = $('Build HTML Parts').first().json;\n\nhtml = html.replace('{{name}}', resume.name);\nhtml = html.replace('{{email}}', resume.contact.email);\nhtml = html.replace('{{phone}}', resume.contact.phone);\nhtml = html.replace('{{location}}', resume.contact.location);\nhtml = html.replace('{{linkedin}}', resume.contact.linkedin);\nhtml = html.replace('{{github}}', resume.contact.github);\nhtml = html.replace('{{summary}}', tailored.summary);\nhtml = html.replace('{{tech_stack}}', tailored.tech_stack.join(' · '));\nhtml = html.replace('{{experience}}', expHtml);\nhtml = html.replace('{{projects}}', projHtml);\nhtml = html.replace('{{education}}', eduHtml);\n\nreturn [{ json: { renderedHtml: html, tailored } }];"
-      },
-      "id": "render-html",
+      "id": "node-render",
       "name": "Render HTML",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3540, 400]
+      "position": [1960, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { tailored, renderedHtml } = $input.first().json;\nconst base64 = Buffer.from(renderedHtml, 'utf-8').toString('base64');\n\nreturn [{\n  json: { tailored },\n  binary: {\n    htmlFile: {\n      data: base64,\n      mimeType: 'text/html',\n      fileName: 'index.html'\n    }\n  }\n}];"
+      },
+      "id": "node-html-binary",
+      "name": "HTML to Binary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2180, 520]
     },
     {
       "parameters": {
         "method": "POST",
         "url": "http://gotenberg:3000/forms/chromium/convert/html",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": []
-        },
         "sendBody": true,
         "contentType": "multipart-form-data",
         "bodyParameters": {
@@ -234,7 +160,7 @@
             {
               "parameterType": "formBinaryData",
               "name": "files",
-              "inputDataFieldName": "renderedHtmlFile"
+              "inputDataFieldName": "htmlFile"
             }
           ]
         },
@@ -247,135 +173,116 @@
           }
         }
       },
-      "id": "gotenberg-pdf",
+      "id": "node-gotenberg",
       "name": "Gotenberg: HTML to PDF",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [3760, 400]
+      "position": [2400, 520]
     },
     {
       "parameters": {
-        "jsCode": "// Convert rendered HTML string to binary so it can be sent as a file\nconst { renderedHtml, tailored } = $('Render HTML').first().json;\n\nconst buf = Buffer.from(renderedHtml, 'utf-8');\nconst base64 = buf.toString('base64');\n\nreturn [{\n  json: { tailored },\n  binary: {\n    renderedHtmlFile: {\n      data: base64,\n      mimeType: 'text/html',\n      fileName: 'resume.html'\n    }\n  }\n}];"
+        "jsCode": "const { PDFDocument } = require('pdf-lib');\n\nconst pdfBin = $input.first().binary.pdfData;\nif (!pdfBin) throw new Error('No PDF data received from Gotenberg');\n\nconst pdfBytes = Buffer.from(pdfBin.data, 'base64');\nconst pdfDoc = await PDFDocument.load(pdfBytes);\nconst pageCount = pdfDoc.getPageCount();\n\nconst tailored = $('HTML to Binary').first().json.tailored;\nconst pageRetryCount = $workflow.staticData.pageRetryCount || 0;\nconst tooLong = pageCount > 1;\n\nif (tooLong) {\n  $workflow.staticData.retryReason = `PDF is ${pageCount} pages. Compress all bullets to 150-160 chars max. Summary under 200 chars. Reduce tech stack to exactly 8 items.`;\n  $workflow.staticData.retryCount = 0;\n}\n\nreturn [{ json: { pageCount, tooLong, pageRetryCount, tailored, pdfBase64: pdfBin.data } }];"
       },
-      "id": "html-to-binary",
-      "name": "HTML to Binary",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [3980, 400]
-    },
-    {
-      "parameters": {
-        "jsCode": "// Use pdf-lib to count pages\nconst { PDFDocument } = require('pdf-lib');\n\nconst pdfBinary = $input.first().binary.pdfData;\nif (!pdfBinary) throw new Error('No PDF received from Gotenberg');\n\nconst pdfBytes = Buffer.from(pdfBinary.data, 'base64');\nconst pdfDoc = await PDFDocument.load(pdfBytes);\nconst pageCount = pdfDoc.getPageCount();\n\nconst tailored = $('Build HTML Parts').first().json.tailored;\nconst pageRetryCount = $workflow.staticData.pageRetryCount || 0;\nconst tooLong = pageCount > 1;\n\nif (tooLong) {\n  $workflow.staticData.retryReason = `Resume rendered as ${pageCount} pages instead of 1. Aggressively compress all bullet points to 150-170 chars each. Reduce summary to under 220 chars. Keep only the 8 most relevant tech stack items.`;\n  $workflow.staticData.retryCount = 0;\n}\n\nreturn [{ json: { pageCount, tooLong, pageRetryCount, tailored, pdfBase64: pdfBinary.data } }];"
-      },
-      "id": "verify-page-count",
+      "id": "node-page-count",
       "name": "Verify Page Count",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [4200, 400]
+      "position": [2620, 520]
     },
     {
       "parameters": {
         "conditions": {
           "boolean": [
             {
-              "value1": "={{ $json.tooLong && $json.pageRetryCount < 2 }}",
+              "value1": "={{ $json.tooLong === true && $json.pageRetryCount < 2 }}",
               "value2": true
             }
           ]
         }
       },
-      "id": "page-retry-check",
+      "id": "node-page-overflow",
       "name": "Page Overflow?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 1,
-      "position": [4420, 400]
+      "position": [2840, 520]
     },
     {
       "parameters": {
-        "jsCode": "$workflow.staticData.pageRetryCount = ($workflow.staticData.pageRetryCount || 0) + 1;\nreturn $input.all();"
+        "jsCode": "$workflow.staticData.pageRetryCount = ($workflow.staticData.pageRetryCount || 0) + 1;\nconst retryReason = $workflow.staticData.retryReason;\nconst base = $('Parse Metadata').first().json;\n\nconst userMsg = `MASTER RESUME:\\n${JSON.stringify(base.resume, null, 2)}\\n\\nJOB DESCRIPTION:\\n${base.jd}\\n\\nREVISION REQUIRED: ${retryReason}`;\n\nconst requestBody = JSON.stringify({\n  model: 'claude-sonnet-4-6',\n  max_tokens: 4096,\n  system: base.tailorPrompt,\n  messages: [{ role: 'user', content: userMsg }]\n});\n\nreturn [{ json: { requestBody } }];"
       },
-      "id": "increment-page-retry",
+      "id": "node-inc-page-retry",
       "name": "Increment Page Retry",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [4640, 300]
+      "position": [3060, 400]
     },
     {
       "parameters": {
-        "jsCode": "const { tailored, pdfBase64 } = $input.first().json;\n\nconst company = (tailored.company || 'Company').replace(/[^a-zA-Z0-9]/g, '_');\nconst role = (tailored.role || 'Role').replace(/[^a-zA-Z0-9]/g, '_');\nconst filename = `Sridhar_Resume_${company}_${role}.pdf`;\nconst outputPath = `/data/output/${filename}`;\n\nreturn [{\n  json: { outputPath, filename, tailored, pdfBase64 },\n  binary: {\n    pdfFile: {\n      data: pdfBase64,\n      mimeType: 'application/pdf',\n      fileName: filename\n    }\n  }\n}];"
+        "jsCode": "const { tailored, pdfBase64 } = $input.first().json;\nconst company = (tailored.company || 'Company').replace(/[^a-zA-Z0-9]/g, '_');\nconst role = (tailored.role || 'Role').replace(/[^a-zA-Z0-9]/g, '_');\nconst filename = `Sridhar_Resume_${company}_${role}.pdf`;\nconst outputPath = `/app/output/${filename}`;\n\nreturn [{\n  json: { outputPath, filename, tailored },\n  binary: {\n    pdfFile: {\n      data: pdfBase64,\n      mimeType: 'application/pdf',\n      fileName: filename\n    }\n  }\n}];"
       },
-      "id": "prep-save",
+      "id": "node-prep-save",
       "name": "Prep Save",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [4640, 500]
+      "position": [3060, 640]
     },
     {
       "parameters": {
         "filePath": "={{ $json.outputPath }}",
         "dataPropertyName": "pdfFile"
       },
-      "id": "save-pdf",
+      "id": "node-save-pdf",
       "name": "Save PDF",
       "type": "n8n-nodes-base.writeBinaryFile",
       "typeVersion": 1,
-      "position": [4860, 500]
+      "position": [3280, 640]
     },
     {
       "parameters": {
         "respondWith": "json",
         "responseBody": "={{ JSON.stringify({ status: 'success', file_path: $('Prep Save').first().json.outputPath, company: $('Prep Save').first().json.tailored.company, role: $('Prep Save').first().json.tailored.role }) }}"
       },
-      "id": "respond-success",
+      "id": "node-respond-ok",
       "name": "Respond: Success",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [5080, 500]
+      "position": [3500, 640]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ status: 'error', stage: 'validation', message: $input.first().json.message || 'Unknown error' }) }}",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: $input.first().json.message || 'Unknown error' }) }}",
         "options": {
           "responseCode": 400
         }
       },
-      "id": "respond-error",
+      "id": "node-respond-err",
       "name": "Respond: Error",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [680, 500]
+      "position": [420, 600]
     }
   ],
   "connections": {
     "Webhook": {
-      "main": [[{ "node": "Validate Input", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Load and Validate", "type": "main", "index": 0 }]]
     },
-    "Validate Input": {
-      "main": [[{ "node": "Read Master Resume", "type": "main", "index": 0 }]]
+    "Load and Validate": {
+      "main": [[{ "node": "Build Extract Request", "type": "main", "index": 0 }]]
     },
-    "Read Master Resume": {
-      "main": [[{ "node": "Parse Resume JSON", "type": "main", "index": 0 }]]
-    },
-    "Parse Resume JSON": {
-      "main": [[{ "node": "Read Extract Prompt", "type": "main", "index": 0 }]]
-    },
-    "Read Extract Prompt": {
-      "main": [[{ "node": "Prep Extract Call", "type": "main", "index": 0 }]]
-    },
-    "Prep Extract Call": {
+    "Build Extract Request": {
       "main": [[{ "node": "Anthropic: Extract Metadata", "type": "main", "index": 0 }]]
     },
     "Anthropic: Extract Metadata": {
       "main": [[{ "node": "Parse Metadata", "type": "main", "index": 0 }]]
     },
     "Parse Metadata": {
-      "main": [[{ "node": "Read Tailor Prompt", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Anthropic: Tailor Resume", "type": "main", "index": 0 }]]
     },
-    "Read Tailor Prompt": {
-      "main": [[{ "node": "Prep Tailor Call", "type": "main", "index": 0 }]]
+    "Increment Length Retry": {
+      "main": [[{ "node": "Anthropic: Tailor Resume", "type": "main", "index": 0 }]]
     },
-    "Prep Tailor Call": {
+    "Increment Page Retry": {
       "main": [[{ "node": "Anthropic: Tailor Resume", "type": "main", "index": 0 }]]
     },
     "Anthropic: Tailor Resume": {
@@ -386,18 +293,9 @@
     },
     "Needs Retry?": {
       "main": [
-        [{ "node": "Increment Retry", "type": "main", "index": 0 }],
-        [{ "node": "Build HTML Parts", "type": "main", "index": 0 }]
+        [{ "node": "Increment Length Retry", "type": "main", "index": 0 }],
+        [{ "node": "Render HTML", "type": "main", "index": 0 }]
       ]
-    },
-    "Increment Retry": {
-      "main": [[{ "node": "Prep Tailor Call", "type": "main", "index": 0 }]]
-    },
-    "Build HTML Parts": {
-      "main": [[{ "node": "Read Template", "type": "main", "index": 0 }]]
-    },
-    "Read Template": {
-      "main": [[{ "node": "Render HTML", "type": "main", "index": 0 }]]
     },
     "Render HTML": {
       "main": [[{ "node": "HTML to Binary", "type": "main", "index": 0 }]]
@@ -417,9 +315,6 @@
         [{ "node": "Prep Save", "type": "main", "index": 0 }]
       ]
     },
-    "Increment Page Retry": {
-      "main": [[{ "node": "Prep Tailor Call", "type": "main", "index": 0 }]]
-    },
     "Prep Save": {
       "main": [[{ "node": "Save PDF", "type": "main", "index": 0 }]]
     },
@@ -435,5 +330,5 @@
   "tags": [],
   "triggerCount": 0,
   "updatedAt": "2026-06-23T00:00:00.000Z",
-  "versionId": "1"
+  "versionId": "2"
 }

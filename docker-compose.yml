@@ -10,16 +10,12 @@ services:
       - N8N_HOST=localhost
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
-      - NODE_ENV=production
       - WEBHOOK_URL=http://localhost:5678/
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - NODE_FUNCTION_ALLOW_EXTERNAL=pdf-lib
     volumes:
       - n8n_data:/home/node/.n8n
-      - ./data:/data
-      - ./templates:/data/templates
-      - ./prompts:/data/prompts
-      - ./output:/data/output
+      - .:/app
     networks:
       - resume_net
     depends_on:
